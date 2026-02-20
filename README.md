@@ -1,4 +1,4 @@
-# ThermalCompton -- thermal (blackbody) Compton event generator for tracking
+# ThermalCompton - thermal (blackbody) Compton event generator for tracking
 
 This repository provides a compact Monte Carlo event generator for **thermal Compton scattering** of ultra-relativistic electrons on **blackbody photons**, intended for integration into multi-turn tracking workflows (e.g., ring-section-by-section event generation). The implementation follows the algorithmic approach described by H. Burkhardt (Thomson-angle proposal sampling with Kleinâ€“Nishina acceptance) and uses an explicit boost/rotation kinematics convention consistent with standard inverse-Compton treatments (see references below).
 
