@@ -1,81 +1,54 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+(C) Validation of the Klein-Nishina accept/reject step at a fixed ERF photon energy k*.
+
+Proposes N scattering angles from the Thomson distribution and accepts each with
+probability (dsigma_KN/dOmega)/(dsigma_T/dOmega), using the exact routines of
+ThermalCompton. The accepted sample must follow Klein-Nishina:
+
+  * acceptance fraction = sigma_KN(k*)/sigma_T (analytic total cross section)
+  * cos(theta*) histogram ∝ dsigma_KN/dcos (chi^2, exact bin integrals)
+  * x = k*_out/k* histogram and mean <x> (chi^2 and pull)
+
+Prints a PASS/FAIL summary (exit status 1 on failure) and saves a two-panel plot.
+
+Usage:
+    python validate_kn_acceptance.py [--kstar-keV 10] [-N 2000000] [--out kn_acceptance_validation.pdf]
+"""
+
 import argparse
-import numpy as np
+import sys
+
 import matplotlib.pyplot as plt
+import numpy as np
 
 from main import ThermalCompton, m_e_GeV
-
-
-def kn_shape_vs_costh(costh: np.ndarray, kstar_GeV: float) -> np.ndarray:
-    """
-    Klein–Nishina "shape" factor used in your code (up to an overall constant):
-        th_shape = 1 + cos^2(theta)
-        x = 1 / (1 + (k*/m_e)(1 - cosθ))
-        kn_shape = x^2 * [ 1 + cos^2θ + (x + 1/x - 2) ]
-    This corresponds to the angular dependence of dσ_KN/dΩ for unpolarized photons.
-    """
-    c = costh
-    x = 1.0 / (1.0 + (kstar_GeV / m_e_GeV) * (1.0 - c))
-    #th = 1.0 + c * c
-    kn = (1.0 + c * c + (x + 1.0 / x - 2.0)) * (x * x)
-    # kn is already the "shape"; no need to divide by th here because we compare to KN itself
-    return kn
-
-
-def expected_x_hist_from_kn(kstar_GeV: float, x_edges: np.ndarray, ngrid: int = 200_000) -> np.ndarray:
-    """
-    Build expected histogram of x = kout*/kin* implied by KN angular distribution at fixed k*.
-    We do this numerically:
-      - sample a dense cosθ grid
-      - compute KN pdf(cosθ) ∝ kn_shape(cosθ)
-      - compute probability mass in each cosθ bin ~ pdf(cosθ_mid)*dc
-      - map cosθ -> x(cosθ)
-      - histogram x with weights=probability mass
-    Returns probability per x-bin (sums to 1 over the x-range covered).
-    """
-    c_edges = np.linspace(-1.0, 1.0, ngrid + 1)
-    c_mid = 0.5 * (c_edges[:-1] + c_edges[1:])
-    dc = c_edges[1] - c_edges[0]
-
-    # KN pdf over cosθ
-    kn = kn_shape_vs_costh(c_mid, kstar_GeV)
-    # Normalize over cosθ in [-1,1]
-    norm = np.trapz(kn, c_mid)
-    pdf_c = kn / norm
-
-    # probability mass for each small cosθ interval
-    w = pdf_c * dc
-
-    # map cosθ -> x
-    x_mid = 1.0 / (1.0 + (kstar_GeV / m_e_GeV) * (1.0 - c_mid))
-
-    # histogram x with weights
-    prob_per_bin, _ = np.histogram(x_mid, bins=x_edges, weights=w)
-    # Ensure numerical normalization
-    if prob_per_bin.sum() > 0:
-        prob_per_bin /= prob_per_bin.sum()
-    return prob_per_bin
+import reference_formulas as rf
 
 
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("-N", type=int, default=2_000_000, help="Number of Thomson proposals")
+    ap = argparse.ArgumentParser(description="(C) Validate the Klein-Nishina acceptance at fixed k*.")
+    ap.add_argument("-N", "--N", type=int, default=2_000_000, help="Number of Thomson proposals")
     ap.add_argument("--bins", type=int, default=120, help="Histogram bins")
     ap.add_argument("--seed", type=int, default=12345, help="RNG seed")
-    ap.add_argument("--kstar-keV", type=float, default=10.0, help="Representative ERF photon energy k* [keV]")
+    ap.add_argument("--kstar-keV", type=float, default=10.0,
+                    help="Representative ERF photon energy k* [keV]")
     ap.add_argument("--out", type=str, default="kn_acceptance_validation.pdf", help="Output figure")
     args = ap.parse_args()
 
+    N = int(args.N)
     rng = np.random.default_rng(args.seed)
 
-    # Convert keV -> GeV (1 GeV = 1e6 keV)
+    # keV -> GeV (1 GeV = 1e6 keV) and eps = k*/(m_e c^2)
     kstar_GeV = float(args.kstar_keV) * 1e-6
+    eps = kstar_GeV / m_e_GeV
 
-    # Acceptance sampling using your exact routines
+    # ---- Thomson proposal + KN acceptance with the generator's routines ----
     accepted_costh = []
     accepted_x = []
-
-    for _ in range(args.N):
-        cos_th, sin_th, phi = ThermalCompton._sample_thomson_angles(rng)
+    for _ in range(N):
+        cos_th, _sin_th, _phi = ThermalCompton._sample_thomson_angles(rng)
         R, x = ThermalCompton._compton_over_thomson_ratio(kstar_GeV, cos_th)
         if rng.random() < R:
             accepted_costh.append(cos_th)
@@ -83,59 +56,78 @@ def main():
 
     accepted_costh = np.asarray(accepted_costh, dtype=np.float64)
     accepted_x = np.asarray(accepted_x, dtype=np.float64)
-
     n_acc = accepted_costh.size
-    acc_frac = n_acc / args.N
-    print(f"k* = {args.kstar_keV:.3f} keV = {kstar_GeV:.3e} GeV")
-    print(f"Accepted: {n_acc:,} / {args.N:,}  (acceptance fraction = {acc_frac:.6f})")
 
-    # ---- cosθ expected curve from KN ----
+    # ---- acceptance fraction vs analytic sigma_KN/sigma_T ----
+    acc_frac = n_acc / N
+    acc_expected = rf.kn_total_over_thomson(eps)
+    acc_err = np.sqrt(acc_expected * (1.0 - acc_expected) / N)
+    pull_acc = (acc_frac - acc_expected) / acc_err
+    print(f"k* = {args.kstar_keV:.3f} keV = {kstar_GeV:.3e} GeV  (k*/m_e = {eps:.5f})")
+    print(f"Accepted: {n_acc:,} / {N:,}  (acceptance fraction = {acc_frac:.6f}, "
+          f"sigma_KN/sigma_T = {acc_expected:.6f})")
+
     bins = args.bins
-    c_counts, c_edges = np.histogram(accepted_costh, bins=bins, range=(-1.0, 1.0))
+
+    # ---- cos(theta*): exact KN bin probabilities ----
+    c_edges = np.linspace(-1.0, 1.0, bins + 1)
+    c_counts, _ = np.histogram(accepted_costh, bins=c_edges)
     c_centers = 0.5 * (c_edges[:-1] + c_edges[1:])
-    dc = c_edges[1] - c_edges[0]
+    expected_c_counts = n_acc * rf.kn_cos_bin_probabilities(c_edges, eps)
+    chi2_c, ndf_c, z_c = rf.chi2_vs_expected(c_counts, expected_c_counts)
 
-    kn_c = kn_shape_vs_costh(c_centers, kstar_GeV)
-    kn_c_norm = kn_c / np.trapz(kn_c, c_centers)  # pdf over cosθ
-    expected_c_counts = kn_c_norm * c_counts.sum() * dc
-
-    # ---- x expected histogram from KN (numerical transform) ----
-    # Determine x-range for plotting from physics:
-    # x_min at cosθ=-1, x_max at cosθ=+1 (x_max=1)
-    x_min = 1.0 / (1.0 + (kstar_GeV / m_e_GeV) * (1.0 - (-1.0)))  # cosθ=-1
-    x_max = 1.0  # cosθ=+1
+    # ---- x = k*_out/k*: x(c) = 1/(1 + eps (1 - c)) is monotonic, so an x-bin
+    # [x_a, x_b] is the cos-bin [c(x_a), c(x_b)] with c(x) = 1 - (1/x - 1)/eps ----
+    x_min = 1.0 / (1.0 + 2.0 * eps)   # back-scattering, cos(theta*) = -1
+    x_max = 1.0                       # forward scattering, cos(theta*) = +1
     x_edges = np.linspace(x_min, x_max, bins + 1)
     x_counts, _ = np.histogram(accepted_x, bins=x_edges)
-
-    prob_x = expected_x_hist_from_kn(kstar_GeV, x_edges, ngrid=200_000)
-    expected_x_counts = prob_x * x_counts.sum()
-
     x_centers = 0.5 * (x_edges[:-1] + x_edges[1:])
+    c_of_x_edges = np.clip(1.0 - (1.0 / x_edges - 1.0) / eps, -1.0, 1.0)
+    expected_x_counts = n_acc * rf.kn_cos_bin_probabilities(c_of_x_edges, eps)
+    chi2_x, ndf_x, z_x = rf.chi2_vs_expected(x_counts, expected_x_counts)
 
-    # Print mean x as a quick check
-    print(f"Sample mean <x> = {accepted_x.mean():.8f}  (x in [~{x_min:.8f}, 1])")
+    # ---- mean <x> vs KN quadrature ----
+    ct, wt = rf.gauss_legendre(-1.0, 1.0, 128)
+    dsig = rf.kn_dsigma_dcos_over_sigmaT(ct, eps)
+    x_of_ct = 1.0 / (1.0 + eps * (1.0 - ct))
+    mean_x_expected = float(np.sum(wt * dsig * x_of_ct) / np.sum(wt * dsig))
+    mean_x = float(accepted_x.mean())
+    pull_x = (mean_x - mean_x_expected) / (float(accepted_x.std(ddof=1)) / np.sqrt(n_acc))
+    print(f"Sample mean <x> = {mean_x:.8f}  (expected {mean_x_expected:.8f}; x in [{x_min:.8f}, 1])")
 
-    # ---- Plot: one figure, two panels ----
+    checks = [
+        ("acceptance fraction = sigma_KN/sigma_T", abs(pull_acc) < 5.0,
+         f"{acc_frac:.6f} vs {acc_expected:.6f} (pull {pull_acc:+.2f} sigma)"),
+        ("cos(theta*) shape (chi^2)", abs(z_c) < 5.0,
+         f"chi2/ndf = {chi2_c:.1f}/{ndf_c} (z = {z_c:+.2f})"),
+        ("x = k*_out/k* shape (chi^2)", abs(z_x) < 5.0,
+         f"chi2/ndf = {chi2_x:.1f}/{ndf_x} (z = {z_x:+.2f})"),
+        ("mean <x>", abs(pull_x) < 5.0, f"pull {pull_x:+.2f} sigma"),
+    ]
+    ok = rf.print_checks(checks, title="(C) Klein-Nishina acceptance checks")
+
+    # ---- plot: one figure, two panels ----
     plt.figure(figsize=(5, 5))
 
     ax1 = plt.subplot(2, 1, 1)
     ax1.hist(
-        accepted_costh, bins=bins, range=(-1.0, 1.0), histtype="stepfilled", 
-        linewidth=2, facecolor="black", edgecolor="black", alpha=0.3, 
+        accepted_costh, bins=c_edges, histtype="stepfilled",
+        linewidth=2, facecolor="black", edgecolor="black", alpha=0.3,
         label=f"Accepted samples (N={n_acc:,})"
-        )
-    ax1.plot(c_centers, expected_c_counts, linewidth=2, color='red', label="KN prediction")
+    )
+    ax1.plot(c_centers, expected_c_counts, linewidth=2, color="red", label="KN prediction")
     ax1.set_xlabel(r"$\cos\theta$")
     ax1.set_ylabel("Counts per bin")
     ax1.legend()
 
     ax2 = plt.subplot(2, 1, 2)
     ax2.hist(
-        accepted_x, bins=x_edges, histtype="stepfilled", 
-        linewidth=2, facecolor="black", edgecolor="black", alpha=0.3, 
+        accepted_x, bins=x_edges, histtype="stepfilled",
+        linewidth=2, facecolor="black", edgecolor="black", alpha=0.3,
         label=f"Accepted samples (N={n_acc:,})"
-        )
-    ax2.plot(x_centers, expected_x_counts, linewidth=2, color='red', label="KN-implied prediction")
+    )
+    ax2.plot(x_centers, expected_x_counts, linewidth=2, color="red", label="KN-implied prediction")
     ax2.set_xlabel(r"$x=k^*_{\mathrm{out}}/k^*_{\mathrm{in}}$")
     ax2.set_ylabel("Counts per bin")
     ax2.legend()
@@ -144,6 +136,8 @@ def main():
     plt.savefig(args.out, dpi=200)
     print(f"Saved: {args.out}")
 
+    return 0 if ok else 1
+
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

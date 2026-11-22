@@ -1,0 +1,6 @@
+# Event generator (main.py)
+numpy
+# Validation plots (validate_*.py)
+matplotlib
+# Automated tests (tests/)
+pytest

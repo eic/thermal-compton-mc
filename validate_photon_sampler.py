@@ -1,28 +1,37 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+(A) Validation of the blackbody photon energy sampler.
+
+Draws N photon energies from the built-in Planck sampler of ThermalCompton and
+compares them with the exact photon-number spectrum p(E) ∝ E^2/(exp(E/kT) - 1):
+
+  * mean energy      <E>   = pi^4/(30 zeta(3)) kT ≈ 2.701 kT
+  * second moment    <E^2> = 12 zeta(5)/zeta(3) (kT)^2 ≈ 10.35 (kT)^2
+  * histogram shape  chi^2 against the exact (bin-integrated) probabilities
+
+Prints a PASS/FAIL summary (exit status 1 on failure) and saves a plot of the
+histogram with the analytic spectrum.
+
+Usage:
+    python validate_photon_sampler.py [--T 300] [-N 300000] [--out photon_sampler_validation.pdf]
+"""
+
 import argparse
-import numpy as np
+import sys
+
 import matplotlib.pyplot as plt
+import numpy as np
 
 # Assumes this script lives next to main.py
 from main import ThermalCompton, kB_eV
-
-
-def planck_photon_number_pdf(E_eV: np.ndarray, kT_eV: float) -> np.ndarray:
-    """
-    Photon-number spectrum (unnormalized):
-        f(E) ∝ E^2 / (exp(E/kT) - 1)
-    Returns an array with the same shape as E_eV.
-    """
-    x = E_eV / kT_eV
-    # Use expm1 for numerical stability for small x
-    denom = np.expm1(x)
-    pdf = np.where(denom > 0.0, (E_eV**2) / denom, 0.0)
-    return pdf
+import reference_formulas as rf
 
 
 def main():
-    ap = argparse.ArgumentParser()
+    ap = argparse.ArgumentParser(description="(A) Validate the blackbody photon energy sampler.")
     ap.add_argument("--T", type=float, default=300.0, help="Temperature [K]")
-    ap.add_argument("-N", type=int, default=300_000, help="Number of samples")
+    ap.add_argument("-N", "--N", type=int, default=300_000, help="Number of samples")
     ap.add_argument("--bins", type=int, default=120, help="Histogram bins")
     ap.add_argument("--Emax", type=float, default=0.5, help="Max energy on plot [eV]")
     ap.add_argument("--nmax", type=int, default=2000, help="Mixture truncation nmax for sampler")
@@ -31,57 +40,65 @@ def main():
     args = ap.parse_args()
 
     T_K = float(args.T)
+    N = int(args.N)
     rng = np.random.default_rng(args.seed)
 
-    # We only need the sampler; Eb/I are irrelevant here
-    tc = ThermalCompton(
-        Eb_GeV=10.0,
-        I_A=2.5,
-        T_K=T_K,
-        nmax_sampler=args.nmax,
-        rng=rng,
-    )
+    # Only the sampler is needed; Eb and I are irrelevant here
+    tc = ThermalCompton(Eb_GeV=10.0, I_A=2.5, T_K=T_K, nmax_sampler=args.nmax, rng=rng)
     sampler = tc.photon_energy_sampler_eV
 
-    # Sample energies [eV]
-    E = sampler.sample_eV(size=args.N)
-
-    # Compute sample mean and expected mean
+    # Sample energies [eV] and the dimensionless x = E/kT
+    E = sampler.sample_eV(size=N)
     kT_eV = kB_eV * T_K
-    mean_sample = float(E.mean())
-    mean_expected = 2.701178 * kT_eV  # π^4/(30 ζ(3)) * kT for photon-number spectrum
+    x = E / kT_eV
 
-    print(f"T = {T_K:.1f} K, kT = {kT_eV:.6f} eV")
-    print(f"Sample mean <E> = {mean_sample:.6f} eV")
-    print(f"Expected <E> ≈ 2.701 kT = {mean_expected:.6f} eV")
-    print(f"Ratio (sample/expected) = {mean_sample/mean_expected:.6f}")
+    # ---- moments vs exact values (pull = deviation / standard error) ----
+    mean_x = float(x.mean())
+    se_mean_x = float(x.std(ddof=1)) / np.sqrt(N)
+    pull_mean = (mean_x - rf.PLANCK_MEAN_X) / se_mean_x
 
-    # Plot range
+    x2 = x * x
+    mean_x2 = float(x2.mean())
+    se_mean_x2 = float(x2.std(ddof=1)) / np.sqrt(N)
+    pull_x2 = (mean_x2 - rf.PLANCK_MEAN_X2) / se_mean_x2
+
+    mean_expected_eV = rf.PLANCK_MEAN_X * kT_eV
+    print(f"T = {T_K:.1f} K, kT = {kT_eV:.6f} eV, N = {N:,}")
+    print(f"Sample mean <E>         = {mean_x * kT_eV:.6f} eV")
+    print(f"Expected <E> = 2.701 kT = {mean_expected_eV:.6f} eV")
+    print(f"Ratio (sample/expected) = {mean_x / rf.PLANCK_MEAN_X:.6f}")
+    print(f"<E^2>/(kT)^2: sample = {mean_x2:.5f}, expected = {rf.PLANCK_MEAN_X2:.5f}")
+
+    # ---- histogram vs exact bin probabilities ----
     Emax = float(args.Emax)
-    # E_plot = E[(E >= 0.0) & (E <= Emax)]
-    E_plot = E  # keep all samples; histogram range will ignore out-of-range values
-
-    # Histogram (counts)
-    counts, edges = np.histogram(E_plot, bins=args.bins, range=(0.0, Emax))
+    edges = np.linspace(0.0, Emax, args.bins + 1)
+    counts, _ = np.histogram(E, bins=edges)
     centers = 0.5 * (edges[:-1] + edges[1:])
-    binw = edges[1] - edges[0]
+    # Expected counts: N times the exact probability of each bin (samples
+    # beyond Emax are accounted for, since the probabilities are absolute)
+    expected_counts = N * rf.planck_bin_probabilities(edges / kT_eV)
+    chi2, ndf, z = rf.chi2_vs_expected(counts, expected_counts)
+    print(f"Histogram: chi2/ndf = {chi2:.1f}/{ndf}")
 
-    # Analytic curve (scaled to histogram counts)
-    pdf = planck_photon_number_pdf(centers, kT_eV)
-    # Normalize pdf over the plotted range so area=1 within [0,Emax]
-    area = np.trapz(pdf, centers)
-    pdf_norm = pdf / area if area > 0 else pdf
-    curve_counts = pdf_norm * counts.sum() * binw
+    checks = [
+        ("mean energy <E>/kT = 2.70118", abs(pull_mean) < 5.0,
+         f"{mean_x:.5f} (pull {pull_mean:+.2f} sigma)"),
+        ("second moment <E^2>/(kT)^2 = 10.3515", abs(pull_x2) < 5.0,
+         f"{mean_x2:.4f} (pull {pull_x2:+.2f} sigma)"),
+        ("spectrum shape (chi^2)", abs(z) < 5.0,
+         f"chi2/ndf = {chi2:.1f}/{ndf} (z = {z:+.2f})"),
+    ]
+    ok = rf.print_checks(checks, title="(A) Photon sampler checks")
 
-    # Single plot: histogram + analytic shape
+    # ---- plot: histogram + analytic spectrum ----
     plt.figure(figsize=(5, 2.5))
     plt.hist(
-        E_plot, bins=args.bins, range=(0.0, Emax), histtype="stepfilled", 
+        E, bins=edges, histtype="stepfilled",
         linewidth=2, facecolor="black", edgecolor="black",
-        alpha=0.3, label=f"Samples (N={len(E_plot):,})"
-        )
-    plt.plot(centers, curve_counts, linewidth=2, color='red', label=r"Analytic $\propto E^2/(\exp(E/kT)-1)$")
-
+        alpha=0.3, label=f"Samples (N={N:,})"
+    )
+    plt.plot(centers, expected_counts, linewidth=2, color="red",
+             label=r"Analytic $\propto E^2/(\exp(E/kT)-1)$")
     plt.xlabel("Photon energy E [eV]")
     plt.ylabel("Counts per bin")
     plt.legend()
@@ -89,6 +106,8 @@ def main():
     plt.savefig(args.out, dpi=200)
     print(f"Saved: {args.out}")
 
+    return 0 if ok else 1
+
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
